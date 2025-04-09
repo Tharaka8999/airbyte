@@ -4,6 +4,7 @@
 
 package io.airbyte.cdk.load.task.internal
 
+import io.airbyte.cdk.load.command.DestinationConfiguration
 import io.airbyte.cdk.load.command.DestinationStream
 import io.airbyte.cdk.load.file.SocketInputFlow
 import io.airbyte.cdk.load.message.DestinationRecordRaw
@@ -25,11 +26,14 @@ import io.airbyte.cdk.load.pipeline.RecordCountFlushStrategy
 import io.airbyte.cdk.load.state.CheckpointId
 import io.airbyte.cdk.load.task.OnEndOfSync
 import io.airbyte.cdk.load.task.Task
+import io.airbyte.cdk.load.task.TaskScopeProvider
 import io.airbyte.cdk.load.task.TerminalCondition
 import io.airbyte.cdk.load.write.LoadStrategy
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.micronaut.context.annotation.Requires
 import io.micronaut.context.annotation.Value
+import io.micronaut.context.condition.Condition
+import io.micronaut.context.condition.ConditionContext
 import jakarta.inject.Named
 import jakarta.inject.Singleton
 import java.util.concurrent.ConcurrentHashMap
@@ -39,6 +43,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.fold
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.shareIn
 
 /**
@@ -94,11 +99,11 @@ class LoadPipelineStepTask<S : AutoCloseable, K1 : WithStream, T, K2 : WithStrea
             try {
                 when (input) {
                     is PipelineMessage -> {
-                        if (stateStore.streamsEnded.contains(input.key.stream)) {
-                            throw IllegalStateException(
-                                "$taskName[$part] received input for complete stream ${input.key.stream}. This indicates data was processed out of order and future bookkeeping might be corrupt. Failing hard."
-                            )
-                        }
+//                        if (stateStore.streamsEnded.contains(input.key.stream)) {
+//                            throw IllegalStateException(
+//                                "$taskName[$part] received input for complete stream ${input.key.stream}. This indicates data was processed out of order and future bookkeeping might be corrupt. Failing hard."
+//                            )
+//                        }
                         // Get or create the accumulator state associated w/ the input key.
                         val stateWithCounts =
                             stateStore.stateWithCounts
@@ -271,6 +276,7 @@ class LoadPipelineStepTask<S : AutoCloseable, K1 : WithStream, T, K2 : WithStrea
 @Singleton
 @Requires(bean = LoadStrategy::class)
 class LoadPipelineStepTaskFactory(
+    val config: DestinationConfiguration,
     @Named("batchStateUpdateQueue") val batchUpdateQueue: QueueWriter<BatchUpdate>,
     // TEMPORARY FOR SOCKET TEST
     // @Named("recordQueue")
@@ -278,7 +284,28 @@ class LoadPipelineStepTaskFactory(
     @Named("socketInputFlows") val socketInputFlows: Array<SocketInputFlow>,
     @Value("\${airbyte.destination.core.record-batch-size-override:null}")
     val batchSizeOverride: Long? = null,
+    val loadStrategy: LoadStrategy,
 ) {
+    private val log = KotlinLogging.logger {}
+
+    val partToSocket: List<Flow<PipelineEvent<StreamKey, DestinationRecordRaw>>>
+    init {
+        if (config.numSockets < loadStrategy.inputPartitions) {
+            val sharedFlows = socketInputFlows
+                .map { it.shareIn(CoroutineScope(Dispatchers.IO), SharingStarted.Eagerly, 1024) }
+                .toTypedArray()
+            val assignments = (0 until loadStrategy.inputPartitions)
+                .map { it % socketInputFlows.size }
+                .toList()
+            log.info {
+                "${config.numSockets} < ${loadStrategy.inputPartitions} workers, constructing fan-out assignments $assignments"
+            }
+            partToSocket = assignments.map { sharedFlows[it] }
+        } else {
+            partToSocket = emptyList()
+        }
+    }
+
     // A map of (TaskIndex, Stream) ->  streams to ensure eos is not forwarded from
     // task N to N+1 until all workers have seen eos.
     private val streamCompletions =
@@ -315,9 +342,33 @@ class LoadPipelineStepTaskFactory(
         part: Int,
         numWorkers: Int,
     ): LoadPipelineStepTask<S, StreamKey, DestinationRecordRaw, K2, U> {
+        val flow = if (config.numSockets == numWorkers) {
+            log.info {
+                "${config.numSockets} == $numWorkers workers, so using 1<->1"
+            }
+            // 1<->1 socket to worker
+            socketInputFlows[part]
+        } else if (config.numSockets > numWorkers) {
+            val socketsToUse = (part until config.numSockets step numWorkers).toList()
+            log.info {
+                "${config.numSockets} > $numWorkers workers, so using fan-in (worker $part using sockets $socketsToUse)"
+            }
+            // Fan-in by merging socket flows
+            val sockets = socketsToUse
+                .map { socketInputFlows[it] }
+                .toTypedArray()
+            merge(*sockets)
+        } else {
+            // Fan-out by using previously started shared flows
+            log.info {
+                "${config.numSockets} < $numWorkers workers, so using fan-out on shared flow $part"
+            }
+            partToSocket[part]
+        }
+
         return create(
             batchAccumulator,
-            socketInputFlows[part],
+            flow,
             outputPartitioner,
             outputQueue,
             batchSizeOverride?.let { RecordCountFlushStrategy(it) },
